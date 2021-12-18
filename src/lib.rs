@@ -41,8 +41,10 @@
 //! [`exclude`]: struct.IpRange.html#method.exclude
 
 extern crate ipnet;
+extern crate serde_json;
 
 use ipnet::{Ipv4Net, Ipv6Net};
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::fmt;
 use std::iter::FromIterator;
@@ -102,6 +104,16 @@ impl<N: IpNet> IpRange<N> {
         }
     }
 
+    /// Insert a network to `self`, same as `add` but having data.
+    ///
+    /// Returns `&mut self` in order to enable method chaining.
+    ///
+    /// The data is serde serialized `Value`.
+    pub fn insert(&mut self, network: N, data: Value) -> &mut Self {
+        self.trie.insert(network, Some(data));
+        self
+    }
+
     /// Add a network to `self`.
     ///
     /// Returns `&mut self` in order to enable method chaining.
@@ -130,7 +142,7 @@ impl<N: IpNet> IpRange<N> {
     ///
     /// [`simplify`]: struct.IpRange.html#method.simplify
     pub fn add(&mut self, network: N) -> &mut Self {
-        self.trie.insert(network);
+        self.trie.insert(network, None);
         self
     }
 
@@ -160,6 +172,13 @@ impl<N: IpNet> IpRange<N> {
     pub fn remove(&mut self, network: N) -> &mut Self {
         self.trie.remove(network);
         self
+    }
+
+    /// Search network trie and return found node
+    pub fn search<T: ToNetwork<N>>(&self, network: &T) -> Option<Vec<Value>> {
+        self.trie
+            .search(network.to_network())
+            .map(|(node_data, _)| node_data)
     }
 
     /// Returns `true` if the `self` has no network.
@@ -249,7 +268,9 @@ impl<N: IpNet> IpRange<N> {
     ///
     /// Returns None if no network in `self` contains `network`.
     pub fn supernet<T: ToNetwork<N>>(&self, network: &T) -> Option<N> {
-        self.trie.search(network.to_network())
+        self.trie
+            .search(network.to_network())
+            .map(|(_, network)| network.to_network())
     }
 
     /// Returns the iterator to `&self`.
@@ -423,7 +444,7 @@ where
         }
     }
 
-    fn insert(&mut self, network: N) {
+    fn insert(&mut self, network: N, data: Option<Value>) {
         // The current node
         let mut node = if let Some(root) = &mut self.root {
             if root.is_leaf() {
@@ -435,6 +456,7 @@ where
             self.root = Some(IpTrieNode::new());
             self.root.as_mut().unwrap() as *mut IpTrieNode
         };
+        let insert_data = data.is_some();
 
         unsafe {
             let bits = network.prefix_bits();
@@ -443,9 +465,9 @@ where
                 let child = &mut (*node).children[i];
                 match child {
                     Some(child) => {
-                        if child.is_leaf() {
-                            // This means the network to be inserted
-                            // is already in the trie.
+                        if child.is_leaf() && !insert_data {
+                            // This means the network to be inserted  is already in
+                            // the trie. Skip this if we have data to be inserted.
                             return;
                         }
                         node = &mut **child as *mut IpTrieNode;
@@ -457,28 +479,45 @@ where
                 }
             }
             (*node).children = [None, None];
+            if insert_data {
+                (*node).data.push(data.unwrap());
+            }
         }
     }
 
-    fn search(&self, network: N) -> Option<N> {
+    fn search(&self, mut network: N) -> Option<(Vec<Value>, N)> {
         let mut node = self.root.as_ref()?;
+        let mut node_data: Vec<&IpTrieNode> = Vec::new();
 
         let bits = network.prefix_bits();
+        let mut loop_break = false;
         for (j, bit) in bits.enumerate() {
-            if node.is_leaf() {
-                return Some(network.with_new_prefix(j as u8));
+            if node.has_data() {
+                node_data.push(&node);
             }
 
             let i = bit as usize;
             let child = node.children[i].as_ref();
             match child {
                 Some(child) => node = child,
-                None => return None,
+                None => {
+                    loop_break = true;
+                    network = network.with_new_prefix(j as u8);
+                    break;
+                }
             }
         }
+        if !loop_break && node.has_data() {
+            node_data.push(&node);
+        }
 
-        if node.is_leaf() {
-            Some(network)
+        if node.is_leaf() || !node_data.is_empty() {
+            let node_data = node_data
+                .into_iter()
+                .map(|node| node.data_ref().to_owned())
+                .flatten()
+                .collect();
+            Some((node_data, network))
         } else {
             None
         }
@@ -524,12 +563,21 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpTrieNode {
     children: [Option<Box<IpTrieNode>>; 2],
+    data: Vec<Value>,
 }
 
 impl IpTrieNode {
     fn new() -> IpTrieNode {
         IpTrieNode {
             children: [None, None],
+            data: Vec::new(),
+        }
+    }
+
+    fn init_data(data: &[Value]) -> IpTrieNode {
+        IpTrieNode {
+            children: [None, None],
+            data: data.to_owned(),
         }
     }
 
@@ -544,6 +592,11 @@ impl IpTrieNode {
     #[inline]
     fn is_leaf(&self) -> bool {
         self.children[0].is_none() && self.children[1].is_none()
+    }
+
+    #[inline]
+    fn has_data(&self) -> bool {
+        !self.data.is_empty()
     }
 
     // If the two children of a node are all leaf node,
@@ -596,8 +649,9 @@ impl IpTrieNode {
         // to remove, we must split it into two deeper nodes.
         if self.is_leaf() {
             self.children = [
-                Some(Box::new(IpTrieNode::new())),
-                Some(Box::new(IpTrieNode::new())),
+                // TODO: Handle remove cases with data
+                Some(Box::new(IpTrieNode::init_data(self.data.as_slice()))),
+                Some(Box::new(IpTrieNode::init_data(self.data.as_slice()))),
             ];
         }
 
@@ -625,6 +679,10 @@ impl IpTrieNode {
                 self.children[i] = None;
             }
         }
+    }
+
+    pub fn data_ref(&self) -> &Vec<Value> {
+        &self.data
     }
 }
 
@@ -876,6 +934,7 @@ impl Iterator for Ipv6PrefixBitIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parse_invalid_networks() {
@@ -891,6 +950,7 @@ mod tests {
         fn get_network(&self, prefix_size: usize, prefix: &str) -> Option<Ipv4Net> {
             self.trie
                 .search(format!("{}/{}", prefix, prefix_size).parse().unwrap())
+                .map(|value| value.1)
         }
     }
 
@@ -1767,4 +1827,80 @@ mod tests {
         ip_range.add("127.0.0.1/32".parse().unwrap());
         assert!(ip_range.contains_network("0.0.0.0/0"));
     }
+
+    #[test]
+    fn insert_ip_address_with_data() {
+        let data = json!({"foo": "bar"});
+        let mut ip_range: IpRange<Ipv4Net> = IpRange::new();
+        ip_range.insert("192.168.1.1/32".parse().unwrap(), data.clone());
+        ip_range.add("192.168.1.2/32".parse().unwrap());
+        assert_eq!(
+            ip_range.search(&"192.168.1.5".parse::<Ipv4Addr>().unwrap()),
+            None,
+        );
+        assert_eq!(
+            ip_range
+                .search(&"192.168.1.1".parse::<Ipv4Addr>().unwrap())
+                .unwrap(),
+            vec![data.clone()],
+        );
+        assert_eq!(
+            ip_range
+                .search(&"192.168.1.2".parse::<Ipv4Addr>().unwrap())
+                .unwrap(),
+            Vec::<Value>::new(),
+        );
+        ip_range.insert("192.168.1.1/32".parse().unwrap(), data.clone());
+        assert_eq!(
+            ip_range
+                .search(&"192.168.1.1".parse::<Ipv4Addr>().unwrap())
+                .unwrap(),
+            vec![data.clone(), data.clone()],
+        );
+    }
+
+    #[test]
+    fn insert_network_with_data() {
+        let data = json!({"foo": "bar"});
+        let mut ip_range: IpRange<Ipv4Net> = IpRange::new();
+        ip_range.insert("192.168.1.0/30".parse().unwrap(), data.clone());
+        ip_range.insert("192.168.1.1/32".parse().unwrap(), data.clone());
+        assert_eq!(
+            ip_range
+                .search(&"192.168.1.3".parse::<Ipv4Addr>().unwrap())
+                .unwrap(),
+            vec![data.clone()],
+        );
+        assert_eq!(
+            ip_range
+                .search(&"192.168.1.1".parse::<Ipv4Addr>().unwrap())
+                .unwrap(),
+            vec![data.clone(), data.clone()],
+        );
+        ip_range.insert("192.168.1.0/28".parse().unwrap(), data.clone());
+        assert_eq!(
+            ip_range
+                .search(&"192.168.1.4".parse::<Ipv4Addr>().unwrap())
+                .unwrap(),
+            vec![data.clone()],
+        );
+        assert_eq!(
+            ip_range.search(&"192.168.1.16".parse::<Ipv4Addr>().unwrap()),
+            None,
+        );
+    }
+
+    // #[test]
+    // fn insert_network_with_data_then_remove_split() {
+    //     let data = json!({"foo": "bar"});
+    //     let mut ip_range: IpRange<Ipv4Net> = IpRange::new();
+    //     ip_range.insert("192.168.1.0/30".parse().unwrap(), data.clone());
+    //     ip_range.remove("192.168.1.3/32".parse().unwrap());
+    //     assert_eq!(
+    //         ip_range
+    //             .search(&"192.168.1.3".parse::<Ipv4Addr>().unwrap())
+    //          ,
+    //         None,
+    //     );
+    // }
 }
