@@ -14,7 +14,7 @@ travis-ci = { repository = "sticnarf/iprange-rs" }
 
 [dependencies]
 ipnet = "2.0.0"
-serde_json = "1.0"
+serde_json = { git = "https://github.com/hyche/json.git" , rev = "4703baa" }
 
 [dev-dependencies]
 rand = "0.3.17"
